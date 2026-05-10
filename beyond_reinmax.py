@@ -92,7 +92,7 @@ class _CategoricalReinMaxCVST(torch.autograd.Function):
         D, pi, tau = ctx.saved_tensors
         eta = ctx.cv_eta
         K = ctx.K
-        eps = 1e-20
+        eps = 1e-6
         grad = grad_output.float()
 
         pi_D = 0.5 * (pi + D)
