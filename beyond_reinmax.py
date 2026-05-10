@@ -9,7 +9,6 @@ class LatentOutput:
     kl: Tensor
     kl_raw: Tensor
 
-/home/tiny/research/experiment/mancer-vae/model.py:L627-L1023
 _LOG_EPS = 1e-12
 
 
