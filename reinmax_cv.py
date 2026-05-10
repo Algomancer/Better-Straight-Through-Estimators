@@ -4,6 +4,12 @@ import torch.nn.functional as F
 from typing import Optional
 from torch import Tensor
 
+class LatentOutput:
+    z: Tensor
+    kl: Tensor
+    kl_raw: Tensor
+
+
 
 class _CategoricalReinMaxCVST(torch.autograd.Function):
     """Hard categorical sample with the ReinMax-CV gradient estimator.
