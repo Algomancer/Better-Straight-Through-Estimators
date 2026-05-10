@@ -122,15 +122,7 @@ class _CategoricalReinMaxCVST(torch.autograd.Function):
 class _CategoricalReinMaxRaoST(torch.autograd.Function):
     """Hard categorical sample with the ReinMax-Rao gradient estimator.
 
-    Wang & Bui (2026), eq 17. Lowest-variance of the three ReinMax variants
-    in the paper's Tables 2-3, and topped both highest-cat-dim configurations
-    (16x12 and 64x8). Drops the STGS term entirely::
 
-        grad = 2 * J_GR^T g  at theta_D, tau    -    0.5 * J(pi)^T g
-
-    Note: the paper's equation 17 places the second term at ``theta_D``;
-    this is a typo. The second term comes from the original ReinMax
-    decomposition and is at ``theta``, which is what we implement here.
     """
 
     @staticmethod
