@@ -16,7 +16,7 @@ def _gumbel_rao_jvp(
     grad: Tensor,
     tau: Tensor,
     K: int,
-    eps: float = 1e-20,
+    eps: float = 1e-6,
 ) -> Tensor:
     """
         theta_D_j + G_j | (D = I_i) =
