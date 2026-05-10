@@ -10,42 +10,89 @@ class LatentOutput:
     kl_raw: Tensor
 
 
+def _gumbel_rao_jvp(
+    D: Tensor,
+    pi_D: Tensor,
+    grad: Tensor,
+    tau: Tensor,
+    K: int,
+    eps: float = 1e-20,
+) -> Tensor:
+    """Average ``J(softmax_tau)^T @ grad`` over K conditional Gumbel samples
+    drawn from ``theta_D + G | D`` where ``theta_D = log(pi_D)``.
+
+    Uses the conditional Gumbel reparameterization of Maddison et al. (2014)
+    and exploits ``Z(theta_D) = sum(pi_D) = 1`` (since ``pi+D`` sums to 2) to
+    drop the normalizer:
+
+        theta_D_j + G_j | (D = I_i) =
+            -log(E_i),                          if j == i
+            -log(E_j / pi_D_j + E_i),           otherwise
+
+    Following Paulus et al. (2021) and the public implementations
+    (nshepperd 2021, Fan et al. 2022), the Jacobian is taken with respect
+    to the conditional Gumbel sample rather than through the conditional
+    reparameterization.
+    """
+    pi_D_safe = pi_D.clamp_min(eps)
+    D_bool = D.bool()
+    E = torch.empty(
+        pi_D.shape + (K,),
+        device=pi_D.device,
+        dtype=pi_D.dtype,
+    )
+    E.exponential_()
+    # E_i: the exponential at the sampled index, broadcast over channels.
+    E_i = (E * D.unsqueeze(-1)).sum(dim=-2)                       # [..., K]
+
+    ratio = E / pi_D_safe.unsqueeze(-1)                            # [..., C, K]
+    ratio = ratio.masked_fill(D_bool.unsqueeze(-1), 0.0)
+    cond_logits = -(ratio + E_i.unsqueeze(-2) + eps).log()         # [..., C, K]
+    pi_GR = (cond_logits / tau).softmax(dim=-2)                    # [..., C, K]
+
+    inner = (pi_GR * grad.unsqueeze(-1)).sum(dim=-2, keepdim=True)
+    return (pi_GR * (grad.unsqueeze(-1) - inner)).mean(dim=-1) / tau
+
 
 class _CategoricalReinMaxCVST(torch.autograd.Function):
     """Hard categorical sample with the ReinMax-CV gradient estimator.
 
-    ReinMax-CV (Wang & Bui, "Beyond ReinMax", arXiv:2603.08257, 2026) reduces
-    the variance of ReinMax by applying a Gumbel-Rao control variate to the
-    high-variance term ST_{tau=1}(D, theta_D), where theta_D is the Heun
-    midpoint reparameterization log((pi + D) / 2).
+    Wang & Bui (2026), "Beyond ReinMax: Low-Variance Gradient Estimators
+    for Discrete Latent Variables" (arXiv:2603.08257).
 
-    Backward gradient:
+    Combines ReinMax (Heun midpoint at tau=1) with a Gumbel-Softmax control
+    variate centered at ``theta_D = log((pi+D)/2)`` and a Gumbel-Rao
+    estimate of its expectation::
 
-        grad = 2 * J(pi_D)^T g  -  0.5 * J(pi)^T g                        [ReinMax]
-             + eta * ( grad_GR(theta_D, tau)  -  grad_STGS(theta_D, tau) ) [CV]
+        grad = 2*J(pi_D)^T g  -  0.5*J(pi)^T g                       [ReinMax]
+             + eta * ( J_GR^T g  -  J_STGS^T g )  at theta_D, tau    [CV]
 
-    where J(p) = diag(p) - p p^T, GR is the Rao-Blackwellised STGS using K
-    conditional Gumbels, and STGS is a single-sample Gumbel-Softmax JVP.
-
-    Defaults follow the paper: tau in [0.7, 1.3] (tunable), eta = 1.5, K = 100.
+    Note: the paper's equation 18 drops the leading factor of 2 on the
+    first ReinMax term -- this is a typo. The reference implementation and
+    the structural derivation in section 3.2 use the full ReinMax expression
+    with the CV correction added, which is what we implement here.
     """
 
     @staticmethod
     def forward(
         ctx,
         logits: Tensor,
-        tau: Tensor,
-        eta: float,
+        cv_tau: Tensor,
+        cv_eta: float,
         mc_samples: int,
     ) -> Tensor:
         probs = logits.float().softmax(dim=-1)
-        flat = probs.reshape(-1, probs.shape[-1])
-        idx = torch.multinomial(flat, num_samples=1, replacement=True)
-        idx = idx.reshape(*probs.shape[:-1])
-        z = F.one_hot(idx, num_classes=probs.shape[-1]).to(logits.dtype)
+        u = torch.rand(
+            (*probs.shape[:-1], 1),
+            device=probs.device,
+            dtype=probs.dtype,
+        )
+        sample = (u > probs.cumsum(dim=-1)).sum(dim=-1)
+        sample = sample.clamp_max(probs.shape[-1] - 1)
+        z = F.one_hot(sample, probs.shape[-1]).to(logits.dtype)
 
-        ctx.save_for_backward(z.float(), probs, tau)
-        ctx.eta = float(eta)
+        ctx.save_for_backward(z.float(), probs, cv_tau.float())
+        ctx.cv_eta = float(cv_eta)
         ctx.K = int(mc_samples)
         ctx.logits_dtype = logits.dtype
         return z
@@ -53,66 +100,124 @@ class _CategoricalReinMaxCVST(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: Tensor):
         D, pi, tau = ctx.saved_tensors
-        eta = ctx.eta
+        eta = ctx.cv_eta
         K = ctx.K
         eps = 1e-20
         grad = grad_output.float()
 
-        # ---- Standard ReinMax (Heun, tau = 1) ----
         pi_D = 0.5 * (pi + D)
-        # 2 * J(pi_D)^T grad
-        grad_rm = 2.0 * pi_D * (grad - (pi_D * grad).sum(-1, keepdim=True))
-        # -0.5 * J(pi)^T grad
-        grad_rm = grad_rm - 0.5 * pi * (grad - (pi * grad).sum(-1, keepdim=True))
 
-        # ---- CV at theta_D = log(pi_D); note Z(theta_D) = 1 ----
-        pi_D_safe = pi_D.clamp_min(eps)
-        log_pi_D = pi_D_safe.log()
+        # Standard ReinMax (Heun midpoint, tau = 1).
+        grad_rm = 2.0 * pi_D * (grad - (pi_D * grad).sum(dim=-1, keepdim=True))
+        grad_rm = grad_rm - 0.5 * pi * (
+            grad - (pi * grad).sum(dim=-1, keepdim=True)
+        )
 
-        # Single-sample STGS at theta_D (control variate)
+        # Single-sample STGS at theta_D, temperature cv_tau.
+        log_pi_D = pi_D.clamp_min(eps).log()
         gumbel = -torch.empty_like(pi_D).exponential_().log()
         pi_GS = ((log_pi_D + gumbel) / tau).softmax(dim=-1)
-        grad_GS = pi_GS * (grad - (pi_GS * grad).sum(-1, keepdim=True)) / tau
+        grad_GS = pi_GS * (
+            grad - (pi_GS * grad).sum(dim=-1, keepdim=True)
+        ) / tau
 
-        # Gumbel-Rao at theta_D via conditional Gumbel reparam (Maddison 2014):
-        #   theta_D_j + G_j | (D = I_i) = -log( E_j / pi_D_j + E_i )
-        # with the convention E_j / pi_D_j := 0 at j = i (then -> -log E_i).
-        D_bool = D.bool()
-        E = torch.empty(pi_D.shape + (K,), device=pi_D.device, dtype=pi_D.dtype)
-        E.exponential_()
-        E_i = E[D_bool].reshape(*pi_D.shape[:-1], K)              # [..., K]
+        # Gumbel-Rao at theta_D with K conditional samples.
+        grad_GR = _gumbel_rao_jvp(D, pi_D, grad, tau, K, eps)
 
-        ratio = E / pi_D_safe.unsqueeze(-1)                       # [..., C, K]
-        ratio = ratio.masked_fill(D_bool.unsqueeze(-1), 0.0)
-        cond_logits = -(ratio + E_i.unsqueeze(-2) + eps).log()    # [..., C, K]
-        pi_GR_all = (cond_logits / tau).softmax(dim=-2)           # [..., C, K]
-
-        inner = (pi_GR_all * grad.unsqueeze(-1)).sum(dim=-2, keepdim=True)
-        grad_GR = (pi_GR_all * (grad.unsqueeze(-1) - inner)).mean(dim=-1) / tau
-
-        # ---- Combine ----
         grad_logits = grad_rm + eta * (grad_GR - grad_GS)
-        # Sum-zero projection: J^T g is sum-zero analytically; numerical safety.
         grad_logits = grad_logits - grad_logits.mean(dim=-1, keepdim=True)
         return grad_logits.to(ctx.logits_dtype), None, None, None
 
 
-class CategoricalReinMaxCVMapper(nn.Module):
-    """Vae mapper"""
+class _CategoricalReinMaxRaoST(torch.autograd.Function):
+    """Hard categorical sample with the ReinMax-Rao gradient estimator.
+
+    Wang & Bui (2026), eq 17. Lowest-variance of the three ReinMax variants
+    in the paper's Tables 2-3, and topped both highest-cat-dim configurations
+    (16x12 and 64x8). Drops the STGS term entirely::
+
+        grad = 2 * J_GR^T g  at theta_D, tau    -    0.5 * J(pi)^T g
+
+    Note: the paper's equation 17 places the second term at ``theta_D``;
+    this is a typo. The second term comes from the original ReinMax
+    decomposition and is at ``theta``, which is what we implement here.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        logits: Tensor,
+        rao_tau: Tensor,
+        mc_samples: int,
+    ) -> Tensor:
+        probs = logits.float().softmax(dim=-1)
+        u = torch.rand(
+            (*probs.shape[:-1], 1),
+            device=probs.device,
+            dtype=probs.dtype,
+        )
+        sample = (u > probs.cumsum(dim=-1)).sum(dim=-1)
+        sample = sample.clamp_max(probs.shape[-1] - 1)
+        z = F.one_hot(sample, probs.shape[-1]).to(logits.dtype)
+
+        ctx.save_for_backward(z.float(), probs, rao_tau.float())
+        ctx.K = int(mc_samples)
+        ctx.logits_dtype = logits.dtype
+        return z
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        D, pi, tau = ctx.saved_tensors
+        K = ctx.K
+        eps = 1e-20
+        grad = grad_output.float()
+
+        pi_D = 0.5 * (pi + D)
+        grad_GR = _gumbel_rao_jvp(D, pi_D, grad, tau, K, eps)
+        grad_st = pi * (grad - (pi * grad).sum(dim=-1, keepdim=True))
+
+        grad_logits = 2.0 * grad_GR - 0.5 * grad_st
+        grad_logits = grad_logits - grad_logits.mean(dim=-1, keepdim=True)
+        return grad_logits.to(ctx.logits_dtype), None, None
+
+
+def _categorical_sample(logits: Tensor, temperature: float) -> Tensor:
+    """Hard categorical sample for non-straight-through prior/posterior draws."""
+    probs = (logits.float() / float(temperature)).softmax(dim=-1)
+    u = torch.rand(
+        (*probs.shape[:-1], 1),
+        device=probs.device,
+        dtype=probs.dtype,
+    )
+    sample = (u > probs.cumsum(dim=-1)).sum(dim=-1)
+    sample = sample.clamp_max(probs.shape[-1] - 1)
+    return F.one_hot(sample, probs.shape[-1]).to(logits.dtype)
+
+
+class CategoricalReinMaxMapper(nn.Module):
+    """Categorical mapper using the ReinMax-CV gradient estimator.
+
+    Wang & Bui (2026). Replaces the original ReinMax with the
+    control-variate variant which is empirically lower-variance on
+    high-dimensional discrete latent VAEs.
+    """
 
     def __init__(
         self,
         bits: int,
         kl_threshold: float = 0.0,
+        *,
+        cv_tau: float = 0.7,
         cv_eta: float = 1.5,
-        mc_samples: int = 100,
+        cv_mc_samples: int = 32,
     ):
         super().__init__()
         self.bits = bits
         self.num_codes = 2 ** bits
         self.kl_threshold = kl_threshold
-        self.cv_eta = cv_eta
-        self.mc_samples = mc_samples
+        self.cv_tau = float(cv_tau)
+        self.cv_eta = float(cv_eta)
+        self.cv_mc_samples = int(cv_mc_samples)
 
     @property
     def projection_dim(self) -> int:
@@ -137,26 +242,24 @@ class CategoricalReinMaxCVMapper(nn.Module):
         if straight_through:
             return _CategoricalReinMaxCVST.apply(
                 logits,
-                logits.new_tensor(float(temperature)),
+                logits.new_tensor(self.cv_tau),
                 self.cv_eta,
-                self.mc_samples,
+                self.cv_mc_samples,
             )
-        probs = (logits.float() / float(temperature)).softmax(dim=-1)
-        u = torch.rand((*probs.shape[:-1], 1), device=probs.device, dtype=probs.dtype)
-        sample = (u > probs.cumsum(dim=-1)).sum(dim=-1).clamp_max(probs.shape[-1] - 1)
-        return F.one_hot(sample, probs.shape[-1]).to(logits.dtype)
+        return _categorical_sample(logits, temperature)
 
     def sample_prior(
         self,
         prior_params: Tensor,
         temperature: float = 1.0,
         z_cache: Optional[Tensor] = None,
-    ) -> "LatentOutput":
+    ) -> LatentOutput:
         z = self._draw(prior_params, temperature, straight_through=False)
         if z_cache is not None and z_cache.shape[1] > 0:
             cache_len = min(z_cache.shape[1], z.shape[1])
             z = z.clone()
             z[:, :cache_len] = z_cache[:, :cache_len].to(z.dtype)
+
         kl = self._zero_kl(prior_params)
         return LatentOutput(z=z, kl=kl, kl_raw=kl)
 
@@ -164,7 +267,7 @@ class CategoricalReinMaxCVMapper(nn.Module):
         self,
         posterior_params: Tensor,
         temperature: float = 1.0,
-    ) -> "LatentOutput":
+    ) -> LatentOutput:
         z = self._draw(posterior_params, temperature, straight_through=True)
         kl = self._zero_kl(posterior_params)
         return LatentOutput(z=z, kl=kl, kl_raw=kl)
@@ -174,7 +277,7 @@ class CategoricalReinMaxCVMapper(nn.Module):
         posterior_logits: Tensor,
         prior_logits: Tensor,
         temperature: float = 1.0,
-    ) -> "LatentOutput":
+    ) -> LatentOutput:
         z = self._draw(posterior_logits, temperature, straight_through=True)
         q_log = F.log_softmax(posterior_logits.float(), dim=-1)
         p_log = F.log_softmax(prior_logits.float(), dim=-1)
@@ -182,3 +285,93 @@ class CategoricalReinMaxCVMapper(nn.Module):
         kl_raw = (q * (q_log - p_log)).sum(dim=-1)
         kl = F.relu(kl_raw - self.kl_threshold)
         return LatentOutput(z=z, kl=kl, kl_raw=kl_raw)
+
+
+class CategoricalReinMaxRaoMapper(nn.Module):
+    """Categorical mapper using the ReinMax-Rao gradient estimator.
+
+    Wang & Bui (2026). Lowest-variance of the three ReinMax variants;
+    drops the STGS term and uses only the Gumbel-Rao estimate. 
+    """
+
+    def __init__(
+        self,
+        bits: int,
+        kl_threshold: float = 0.0,
+        *,
+        rao_tau: float = 0.7,
+        rao_mc_samples: int = 32,
+    ):
+        super().__init__()
+        self.bits = bits
+        self.num_codes = 2 ** bits
+        self.kl_threshold = kl_threshold
+        self.rao_tau = float(rao_tau)
+        self.rao_mc_samples = int(rao_mc_samples)
+
+    @property
+    def projection_dim(self) -> int:
+        return self.num_codes
+
+    @property
+    def latent_width(self) -> int:
+        return self.num_codes
+
+    def empty_cache(self, batch: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+        return torch.empty(batch, 0, self.num_codes, device=device, dtype=dtype)
+
+    def _zero_kl(self, params: Tensor) -> Tensor:
+        return torch.zeros_like(params[..., 0])
+
+    def _draw(
+        self,
+        logits: Tensor,
+        temperature: float = 1.0,
+        straight_through: bool = True,
+    ) -> Tensor:
+        if straight_through:
+            return _CategoricalReinMaxRaoST.apply(
+                logits,
+                logits.new_tensor(self.rao_tau),
+                self.rao_mc_samples,
+            )
+        return _categorical_sample(logits, temperature)
+
+    def sample_prior(
+        self,
+        prior_params: Tensor,
+        temperature: float = 1.0,
+        z_cache: Optional[Tensor] = None,
+    ) -> LatentOutput:
+        z = self._draw(prior_params, temperature, straight_through=False)
+        if z_cache is not None and z_cache.shape[1] > 0:
+            cache_len = min(z_cache.shape[1], z.shape[1])
+            z = z.clone()
+            z[:, :cache_len] = z_cache[:, :cache_len].to(z.dtype)
+
+        kl = self._zero_kl(prior_params)
+        return LatentOutput(z=z, kl=kl, kl_raw=kl)
+
+    def sample_posterior(
+        self,
+        posterior_params: Tensor,
+        temperature: float = 1.0,
+    ) -> LatentOutput:
+        z = self._draw(posterior_params, temperature, straight_through=True)
+        kl = self._zero_kl(posterior_params)
+        return LatentOutput(z=z, kl=kl, kl_raw=kl)
+
+    def posterior_with_kl(
+        self,
+        posterior_logits: Tensor,
+        prior_logits: Tensor,
+        temperature: float = 1.0,
+    ) -> LatentOutput:
+        z = self._draw(posterior_logits, temperature, straight_through=True)
+        q_log = F.log_softmax(posterior_logits.float(), dim=-1)
+        p_log = F.log_softmax(prior_logits.float(), dim=-1)
+        q = q_log.exp()
+        kl_raw = (q * (q_log - p_log)).sum(dim=-1)
+        kl = F.relu(kl_raw - self.kl_threshold)
+        return LatentOutput(z=z, kl=kl, kl_raw=kl_raw)
+
