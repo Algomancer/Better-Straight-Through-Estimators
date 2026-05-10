@@ -9,6 +9,17 @@ class LatentOutput:
     kl: Tensor
     kl_raw: Tensor
 
+/home/tiny/research/experiment/mancer-vae/model.py:L627-L1023
+_LOG_EPS = 1e-12
+
+
+def _safe_exponential_like(x: Tensor) -> Tensor:
+    """Draw Exp(1) samples with the same shape/dtype/device as ``x``,
+    clamped above ``_LOG_EPS`` so subsequent ``log`` is finite."""
+    out = torch.empty_like(x)
+    out.exponential_()
+    return out.clamp_min(_LOG_EPS)
+
 
 def _gumbel_rao_jvp(
     D: Tensor,
@@ -16,28 +27,40 @@ def _gumbel_rao_jvp(
     grad: Tensor,
     tau: Tensor,
     K: int,
-    eps: float = 1e-6,
+    eps: float = _LOG_EPS,
+    sample_exp: Tensor | None = None,
 ) -> Tensor:
-    """
-        theta_D_j + G_j | (D = I_i) =
-            -log(E_i),                          if j == i
-            -log(E_j / pi_D_j + E_i),           otherwise
+    D = D.float()
+    pi_D = pi_D.float()
+    grad = grad.float()
+    tau = tau.float()
 
-    """
     pi_D_safe = pi_D.clamp_min(eps)
     D_bool = D.bool()
-    E = torch.empty(
-        pi_D.shape + (K,),
-        device=pi_D.device,
-        dtype=pi_D.dtype,
-    )
-    E.exponential_()
-    # E_i: the exponential at the sampled index, broadcast over channels.
-    E_i = (E * D.unsqueeze(-1)).sum(dim=-2)                       # [..., K]
+    if sample_exp is None:
+        E_shape = pi_D.shape + (K,)
+        E = torch.empty(E_shape, device=pi_D.device, dtype=pi_D.dtype)
+        E.exponential_()
+    else:
+        E = sample_exp.to(device=pi_D.device, dtype=pi_D.dtype)
 
-    ratio = E / pi_D_safe.unsqueeze(-1)                            # [..., C, K]
-    ratio = ratio.masked_fill(D_bool.unsqueeze(-1), 0.0)
-    cond_logits = -(ratio + E_i.unsqueeze(-2) + eps).log()         # [..., C, K]
+    finfo = torch.finfo(E.dtype)
+    E = torch.nan_to_num(E, nan=1.0, posinf=finfo.max, neginf=eps)
+    E = E.clamp(min=eps, max=finfo.max)
+
+    sample_idx = D.argmax(dim=-1, keepdim=True)
+    gather_idx = sample_idx.unsqueeze(-1).expand(*sample_idx.shape, K)
+    E_i = E.gather(dim=-2, index=gather_idx).squeeze(-2)           # [..., K]
+
+    log_E = E.log()
+    log_E_i = E_i.log()
+    log_pi_D = pi_D_safe.log()
+    nonselected = -torch.logaddexp(
+        log_E - log_pi_D.unsqueeze(-1),
+        log_E_i.unsqueeze(-2),
+    )
+    selected = -log_E_i.unsqueeze(-2)
+    cond_logits = torch.where(D_bool.unsqueeze(-1), selected, nonselected)
     pi_GR = (cond_logits / tau).softmax(dim=-2)                    # [..., C, K]
 
     inner = (pi_GR * grad.unsqueeze(-1)).sum(dim=-2, keepdim=True)
@@ -92,7 +115,7 @@ class _CategoricalReinMaxCVST(torch.autograd.Function):
         D, pi, tau = ctx.saved_tensors
         eta = ctx.cv_eta
         K = ctx.K
-        eps = 1e-6
+        eps = _LOG_EPS
         grad = grad_output.float()
 
         pi_D = 0.5 * (pi + D)
@@ -105,7 +128,7 @@ class _CategoricalReinMaxCVST(torch.autograd.Function):
 
         # Single-sample STGS at theta_D, temperature cv_tau.
         log_pi_D = pi_D.clamp_min(eps).log()
-        gumbel = -torch.empty_like(pi_D).exponential_().log()
+        gumbel = -_safe_exponential_like(pi_D).log()
         pi_GS = ((log_pi_D + gumbel) / tau).softmax(dim=-1)
         grad_GS = pi_GS * (
             grad - (pi_GS * grad).sum(dim=-1, keepdim=True)
@@ -122,7 +145,15 @@ class _CategoricalReinMaxCVST(torch.autograd.Function):
 class _CategoricalReinMaxRaoST(torch.autograd.Function):
     """Hard categorical sample with the ReinMax-Rao gradient estimator.
 
+    Wang & Bui (2026), eq 17. Lowest-variance of the three ReinMax variants
+    in the paper's Tables 2-3, and topped both highest-cat-dim configurations
+    (16x12 and 64x8). Drops the STGS term entirely::
 
+        grad = 2 * J_GR^T g  at theta_D, tau    -    0.5 * J(pi)^T g
+
+    Note: the paper's equation 17 places the second term at ``theta_D``;
+    this is a typo. The second term comes from the original ReinMax
+    decomposition and is at ``theta``, which is what we implement here.
     """
 
     @staticmethod
@@ -151,11 +182,10 @@ class _CategoricalReinMaxRaoST(torch.autograd.Function):
     def backward(ctx, grad_output: Tensor):
         D, pi, tau = ctx.saved_tensors
         K = ctx.K
-        eps = 1e-20
         grad = grad_output.float()
 
         pi_D = 0.5 * (pi + D)
-        grad_GR = _gumbel_rao_jvp(D, pi_D, grad, tau, K, eps)
+        grad_GR = _gumbel_rao_jvp(D, pi_D, grad, tau, K, _LOG_EPS)
         grad_st = pi * (grad - (pi * grad).sum(dim=-1, keepdim=True))
 
         grad_logits = 2.0 * grad_GR - 0.5 * grad_st
@@ -182,6 +212,10 @@ class CategoricalReinMaxMapper(nn.Module):
     Wang & Bui (2026). Replaces the original ReinMax with the
     control-variate variant which is empirically lower-variance on
     high-dimensional discrete latent VAEs.
+
+    Has no learnable parameters; ``cv_tau``/``cv_eta``/``cv_mc_samples``
+    are plain Python attributes so the state dict matches a vanilla
+    ReinMax mapper -- existing checkpoints can resume directly.
     """
 
     def __init__(
@@ -273,7 +307,8 @@ class CategoricalReinMaxRaoMapper(nn.Module):
     """Categorical mapper using the ReinMax-Rao gradient estimator.
 
     Wang & Bui (2026). Lowest-variance of the three ReinMax variants;
-    drops the STGS term and uses only the Gumbel-Rao estimate. 
+    drops the STGS term and uses only the Gumbel-Rao estimate. Best on
+    the largest-cat-dim configurations in the paper's Tables 2-3.
     """
 
     def __init__(
@@ -356,4 +391,5 @@ class CategoricalReinMaxRaoMapper(nn.Module):
         kl_raw = (q * (q_log - p_log)).sum(dim=-1)
         kl = F.relu(kl_raw - self.kl_threshold)
         return LatentOutput(z=z, kl=kl, kl_raw=kl_raw)
+
 
