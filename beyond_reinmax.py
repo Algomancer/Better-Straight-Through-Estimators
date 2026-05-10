@@ -18,21 +18,11 @@ def _gumbel_rao_jvp(
     K: int,
     eps: float = 1e-20,
 ) -> Tensor:
-    """Average ``J(softmax_tau)^T @ grad`` over K conditional Gumbel samples
-    drawn from ``theta_D + G | D`` where ``theta_D = log(pi_D)``.
-
-    Uses the conditional Gumbel reparameterization of Maddison et al. (2014)
-    and exploits ``Z(theta_D) = sum(pi_D) = 1`` (since ``pi+D`` sums to 2) to
-    drop the normalizer:
-
+    """
         theta_D_j + G_j | (D = I_i) =
             -log(E_i),                          if j == i
             -log(E_j / pi_D_j + E_i),           otherwise
 
-    Following Paulus et al. (2021) and the public implementations
-    (nshepperd 2021, Fan et al. 2022), the Jacobian is taken with respect
-    to the conditional Gumbel sample rather than through the conditional
-    reparameterization.
     """
     pi_D_safe = pi_D.clamp_min(eps)
     D_bool = D.bool()
